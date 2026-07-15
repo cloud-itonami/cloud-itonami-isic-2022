@@ -1,0 +1,41 @@
+{:itonami.blueprint/id "cloud-itonami-isic-2022"
+ :itonami.blueprint/name "Manufacture of paints, varnishes and similar coatings, printing ink and mastics"
+ :itonami.blueprint/isic-rev5 "2022"
+ :itonami.blueprint/domain :paint-coatings-ink-mastics/manufacturing
+ :itonami.blueprint/license "AGPL-3.0-or-later"
+ :itonami.blueprint/social-impact [:worker-safety :consumer-safety :environmental-safety]
+ :itonami.blueprint/governor :paint-coatings-plant-operations-governor
+ :itonami.blueprint/robotics true
+ :itonami.blueprint/required-technologies [:robotics :identity :forms :dmn :bpmn :audit-ledger :cae :cfd]
+ :itonami.blueprint/optional-technologies []
+ :itonami.blueprint/status :public-oss
+ :itonami.blueprint/maturity :implemented
+ :itonami.blueprint/implemented-slice
+ "PaintAdvisor ⊣ Paint & Coatings Plant Operations Governor, langgraph-clj
+ StateGraph, append-only audit ledger. A plant OPERATIONS COORDINATION
+ actor for paints, varnishes and similar coatings, printing ink, and
+ mastics manufacturing (pigment-dispersion equipment -- high-speed
+ dispersers and bead/ball mills -- plus tinting and filling lines
+ producing interior/exterior paints, varnishes, lacquers, primers/
+ sealers/undercoats, industrial and marine coatings, offset/
+ flexographic/gravure printing ink, and mastics/sealants/caulks) --
+ not direct mixing/dispersion-line-equipment control authority. Four
+ ops (`:log-production-batch` / `:schedule-maintenance` /
+ `:flag-safety-concern` / `:coordinate-shipment`), all `:effect
+ :propose` only. Twelve concrete governor checks elaborate this
+ blueprint's four HARD invariants: propose-only effect, closed op
+ allowlist, closed proposal-effect allowlist (no direct mixing/
+ dispersion-line-equipment control), permanent line-actuate block,
+ independent equipment verification/registration before maintenance
+ scheduling, independent batch verification/registration before
+ shipment coordination, independent shipment-weight recompute against
+ the batch's own logged weight, double-schedule guard, product-type
+ validation, viscosity plausibility validation, fineness-of-grind
+ (pigment-dispersion-quality) plausibility validation, and VOC
+ (volatile organic compound) content regulatory-ceiling validation
+ (modeled on the U.S. EPA AIM VOC-content-limit framework and the EU
+ Decopaint Directive 2004/42/EC). Safety-concern flagging (chemical-
+ hazard solvent-VOC-exposure/flammability/equipment-safety) ALWAYS
+ escalates to a human plant supervisor; `:log-production-batch` is the
+ only op eligible to auto-commit, and only at phase 3 when
+ governor-clean."}
