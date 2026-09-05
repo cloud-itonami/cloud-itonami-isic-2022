@@ -1,42 +1,55 @@
 (ns paintmfg.render-html
   "Build-time HTML renderer for `docs/samples/operator-console.html`.
 
-  Drives the REAL actor stack -- `paintmfg.store` (seed) ->
-  `paintmfg.operation` (langgraph StateGraph) -> `paintmfg.advisor`
-  (contained intelligence) -> `paintmfg.governor` (independent censor)
-  -> `paintmfg.phase` (rollout gate) -- and renders the resulting SSoT
-  and append-only ledger. NOTHING on the page is hand-written domain
-  data: every batch/equipment/maintenance/shipment/safety-concern row
-  is read back out of the store the actor just wrote, and every HARD
-  hold row is the governor's OWN `:rule`/`:detail` pair as it was
-  appended to the ledger.
+  WHAT IS REAL HERE (and how it was verified):
 
-  Scenario provenance: the request sequence in `run-demo!` is adapted
-  from this repo's own `paintmfg.sim` demo driver (`clojure -M:dev:run`,
-  run BEFORE writing this file to confirm the ids it drives are the
-  ids `paintmfg.store/sample-data!` actually seeds -- `batch-001`,
-  `batch-002`, `batch-003`, `disperser-001`, `mill-002`). Every other
-  subject (`mnt-1`, `concern-1`, `ship-1`) is CREATED by the very op
-  that names it, via `paintmfg.store/commit-record!`. No fabricated
-  input reaches the actor.
+  Every row on the generated page is produced by EXECUTING this repo's
+  own actor stack -- `paintmfg.store/mem-store` + `sample-data!` ->
+  `paintmfg.operation/build` -> `langgraph.graph/run*` (same thread-id /
+  `:resume? true` approval convention `paintmfg.sim` uses) ->
+  `paintmfg.governor` -> `paintmfg.phase`. Nothing on the page is
+  hand-typed domain data:
 
-  Ledger-shape note: `paintmfg.operation` appends only `:committed`
-  (from the `:commit` node) and the hold facts `:governor-hold` /
-  `:approval-rejected` (from the `:hold` node) to the store ledger.
-  `:approval-requested` and `:approval-granted` live ONLY on the
-  in-memory `:audit` channel and are NEVER persisted -- so this
-  renderer never branches on them.
+    * the batch / equipment / safety-concern / draft-record tables are
+      read back OUT of the store AFTER the run, so they show the ground
+      truth the run actually left behind (e.g. batch-001's
+      `:shipped-weight-kg` is 1000.0 + 500.0 because the ship-1 shipment
+      really committed, and disperser-001's
+      `:last-scheduled-maintenance-date` exists only because mnt-1
+      really committed);
+    * the scenario and audit-ledger tables render the real `:verdict` /
+      `:disposition` / `:basis` values the graph produced -- the HOLD
+      rule names are `paintmfg.governor`'s own `:rule` keywords, not
+      prose;
+    * the action-gate table is derived from LIVE values --
+      `paintmfg.governor/allowed-ops`, `allowed-proposal-effects`,
+      `high-stakes`, `confidence-floor`, `paintmfg.phase/phases` +
+      `write-ops` + `default-phase`, and the `:stake` each op's real
+      proposal actually declared during this run;
+    * the VOC regulatory-ceiling table is
+      `paintmfg.registry/voc-limit-g-per-l` itself.
 
-  Determinism: no timestamps, no randomness, no wall-clock. Store
-  accessors sort by `:id`; the ledger is append-only in request order;
-  sequence numbers (`MNT-000000`, `SHP-000000`) come from the store's
-  own counters. Two consecutive runs are byte-identical.
+  INPUT PROVENANCE: every entity id referenced by a request already
+  exists in `paintmfg.store/sample-data!` -- batches `batch-001`,
+  `batch-002`, `batch-003`; equipment `disperser-001`, `mill-002`.
+  (`mnt-1`..`mnt-3`, `concern-1`, `ship-1`..`ship-3` are the ids of the
+  NEW draft records this run creates, exactly as `paintmfg.sim` does --
+  they are subjects being created, not references to entities that must
+  pre-exist.) No field is rendered that is absent from the domain model.
+
+  VERIFIED BEFORE WRITING THIS FILE: `clojure -M:dev:run` was executed
+  and its output read -- the seeded ids, the four ops, and every HARD
+  hold reproduced here came from that run, not from guesswork.
+
+  DETERMINISTIC: no timestamp, no randomness, no wall-clock content;
+  every set is sorted before rendering and the store's own accessors
+  (`all-batches` / `all-equipment`) already sort by `:id`. Two
+  consecutive runs are byte-identical (verify with `diff`).
 
   Usage: `clojure -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
-  (:require [clojure.java.io :as io]
+  (:require [jp-go-dds.skin]
             [clojure.string :as str]
-            [jp-go-dds.skin :as skin]
             [langgraph.graph :as g]
             [paintmfg.governor :as governor]
             [paintmfg.operation :as op]
@@ -44,434 +57,478 @@
             [paintmfg.registry :as registry]
             [paintmfg.store :as store]))
 
-;; ----------------------------- driving the real actor -----------------------------
-
 (def ^:private coordinator
   {:actor-id "coord-1" :actor-role :plant-coordinator :phase 3})
 
-(defn- exec!
-  "One coordination request = one supervised actor run."
-  [actor tid request]
+(defn- exec! [actor tid request]
   (g/run* actor {:request request :context coordinator} {:thread-id tid}))
 
-(defn- approve!
-  "Resume an interrupted run with a human plant supervisor's approval."
-  [actor tid]
+(defn- approve! [actor tid]
   (g/run* actor {:approval {:status :approved :by "coord-1"}}
           {:thread-id tid :resume? true}))
 
 (defn run-demo!
-  "Runs a freshly seeded store through every disposition this actor can
-  reach, then through EVERY HARD governor rule this repo implements.
+  "Runs a fresh seeded store through a scenario mirrored from
+  `paintmfg.sim` (not calling its `-main`, to keep this namespace
+  self-contained and free of println noise). Every referenced batch /
+  equipment id below is a real `paintmfg.store/sample-data!` seed id.
 
-  Clean paths (all against seeded ids):
-    - `batch-001` logs a clean production-batch patch -- phase-3
-      auto-commit (`:log-production-batch` is the only member of
-      phase 3's `:auto` set).
-    - `mnt-1` schedules a maintenance window against the verified,
-      registered `disperser-001` -- `:schedule-maintenance` is
-      deliberately absent from EVERY phase's `:auto` set, so it
-      escalates to a human even when the governor is clean; approved.
-    - `concern-1` flags a solvent-VOC safety concern -- ALWAYS
-      escalates (`:coordination/safety-concern` is in the governor's
-      own `high-stakes` set); approved.
-    - `ship-1` coordinates a 500 kg shipment off `batch-001`
-      (5000 kg produced, 1000 kg already shipped -- within its own
-      logged weight); approved.
+  Clean lifecycle (governor clears -> phase gate -> commit):
 
-  HARD holds -- each one produced by the governor's own rules on
-  deliberately non-compliant input, and none of which ever reaches a
-  human:
-    - request `:effect` other than `:propose`   -> `:not-propose-effect`
-    - op outside the closed allowlist           -> `:unknown-op`
-                                                   + `:line-control-blocked`
-    - maintenance on the UNVERIFIED `mill-002`  -> `:equipment-not-verified`
-    - shipment off the UNVERIFIED `batch-003`   -> `:batch-not-verified`
-    - 1000 kg off `batch-002` (8000 kg produced,
-      7500 kg already shipped)                  -> `:shipment-weight-exceeded`
-    - `:actuate-line? true`                     -> `:line-actuate-blocked`
-    - re-scheduling `mnt-1`                     -> `:already-scheduled`
-    - fabricated product type                   -> `:invalid-product-type`
-    - negative viscosity                        -> `:invalid-viscosity`
-    - Hegman 12.0 (gauge tops out at 8.0)       -> `:invalid-fineness-of-grind`
-    - 400 g/L VOC on an interior flat paint
-      (EPA-AIM/Decopaint-modeled ceiling 50 g/L) -> `:voc-content-exceeds-limit`
+    1. `:log-production-batch` batch-001, clean patch -- the ONLY
+       auto-eligible op at phase 3, so it commits with no human.
+    2. `:schedule-maintenance` mnt-1 on disperser-001 (verified +
+       registered high-speed disperser) -- never auto at ANY phase ->
+       escalate -> human approves -> commit.
+    3. `:flag-safety-concern` concern-1 on disperser-001 -- ALWAYS
+       high-stakes (`:coordination/safety-concern`) -> escalate ->
+       approve -> commit.
+    4. `:coordinate-shipment` ship-1 on batch-001, 500.0 kg (5000 kg
+       logged, 1000 kg already shipped, so it fits) -> escalate ->
+       approve -> commit.
 
-  Returns the store. Every field `render` reads below is real
-  governor/store output."
+  HARD holds -- none of these ever reaches a human:
+
+    5. request `:effect` not `:propose`      -> `:not-propose-effect`
+    6. unrecognized op                        -> `:unknown-op` +
+                                                 `:line-control-blocked`
+    7. maintenance on mill-002 (UNVERIFIED)   -> `:equipment-not-verified`
+    8. shipment on batch-003 (UNVERIFIED)     -> `:batch-not-verified`
+    9. shipment ship-3 on batch-002, 1000 kg
+       (7500 shipped + 1000 > 8000 logged)    -> `:shipment-weight-exceeded`
+   10. maintenance with `:actuate-line? true` -> `:line-actuate-blocked`
+                                                 (PERMANENT: no phase and
+                                                 no human approval can
+                                                 ever override it)
+   11. mnt-1 scheduled a second time          -> `:already-scheduled`
+   12. fabricated `:product-type`             -> `:invalid-product-type`
+   13. negative `:viscosity-cp`               -> `:invalid-viscosity`
+   14. 12.0 Hegman (gauge maxes at 8.0)       -> `:invalid-fineness-of-grind`
+   15. 400.0 g/L VOC on an interior-flat-paint
+       batch (ceiling 50.0 g/L)               -> `:voc-content-exceeds-limit`
+
+  Returns `{:db store :runs [{:label .. :tid .. :request .. :state ..}]}`
+  -- `:state` is the graph's own final state, so the rendered
+  disposition/verdict/proposal values are the actor's, not a copy."
   []
   (let [db (-> (store/mem-store) (store/sample-data!))
-        actor (op/build db)]
+        actor (op/build db)
+        runs (atom [])
+        step! (fn [label tid request & [approve?]]
+                (let [r (exec! actor tid request)
+                      r (if approve? (approve! actor tid) r)]
+                  (swap! runs conj {:label label :tid tid :request request
+                                    :state (:state r)})
+                  r))]
 
-    ;; --- clean paths ---
-    (exec! actor "t1" {:op :log-production-batch :effect :propose :subject "batch-001"
-                       :patch {:product-type :interior-flat-paint
-                               :last-assessed "2026-07-14"}})
+    (step! "clean batch intake (auto-commit)" "t1"
+           {:op :log-production-batch :effect :propose :subject "batch-001"
+            :patch {:product-type :interior-flat-paint :last-assessed "2026-07-14"}})
 
-    (exec! actor "t2" {:op :schedule-maintenance :effect :propose :subject "mnt-1"
-                       :value {:equipment-id "disperser-001"
-                               :maintenance-type :blade-inspection
-                               :scheduled-date "2026-08-01"
-                               :actuate-line? false}})
-    (approve! actor "t2")
+    (step! "maintenance window on a verified disperser (approved)" "t2"
+           {:op :schedule-maintenance :effect :propose :subject "mnt-1"
+            :value {:equipment-id "disperser-001" :maintenance-type :blade-inspection
+                    :scheduled-date "2026-08-01" :actuate-line? false}}
+           true)
 
-    (exec! actor "t3" {:op :flag-safety-concern :effect :propose :subject "concern-1"
-                       :value {:equipment-id "disperser-001"
-                               :severity :moderate
-                               :description "分散工程周辺の溶剤VOC蒸気濃度上昇"}})
-    (approve! actor "t3")
+    (step! "safety concern (always high-stakes, approved)" "t3"
+           {:op :flag-safety-concern :effect :propose :subject "concern-1"
+            :value {:equipment-id "disperser-001" :severity :moderate
+                    :description "分散工程周辺の溶剤VOC蒸気濃度上昇"}}
+           true)
 
-    (exec! actor "t4" {:op :coordinate-shipment :effect :propose :subject "ship-1"
-                       :value {:batch-id "batch-001" :weight-kg 500.0
-                               :destination "buyer-yard-north"}})
-    (approve! actor "t4")
+    (step! "shipment within the batch's own logged weight (approved)" "t4"
+           {:op :coordinate-shipment :effect :propose :subject "ship-1"
+            :value {:batch-id "batch-001" :weight-kg 500.0
+                    :destination "buyer-yard-north"}}
+           true)
 
-    ;; --- HARD holds ---
-    (exec! actor "t5" {:op :log-production-batch :effect :direct-write :subject "batch-001"
-                       :patch {:product-type :interior-flat-paint}})
+    (step! "request :effect is not :propose" "t5"
+           {:op :log-production-batch :effect :direct-write :subject "batch-001"
+            :patch {:product-type :interior-flat-paint}})
 
-    (exec! actor "t6" {:op :actuate-disperser :effect :propose :subject "batch-001"})
+    (step! "unrecognized op" "t6"
+           {:op :actuate-disperser :effect :propose :subject "batch-001"})
 
-    (exec! actor "t7" {:op :schedule-maintenance :effect :propose :subject "mnt-2"
-                       :value {:equipment-id "mill-002"
-                               :maintenance-type :media-inspection
-                               :scheduled-date "2026-08-01"
-                               :actuate-line? false}})
+    (step! "maintenance on an UNVERIFIED bead mill" "t7"
+           {:op :schedule-maintenance :effect :propose :subject "mnt-2"
+            :value {:equipment-id "mill-002" :maintenance-type :media-inspection
+                    :scheduled-date "2026-08-01" :actuate-line? false}})
 
-    (exec! actor "t8" {:op :coordinate-shipment :effect :propose :subject "ship-2"
-                       :value {:batch-id "batch-003" :weight-kg 1000.0
-                               :destination "buyer-yard-south"}})
+    (step! "shipment against an UNVERIFIED batch" "t8"
+           {:op :coordinate-shipment :effect :propose :subject "ship-2"
+            :value {:batch-id "batch-003" :weight-kg 1000.0
+                    :destination "buyer-yard-south"}})
 
-    (exec! actor "t9" {:op :coordinate-shipment :effect :propose :subject "ship-3"
-                       :value {:batch-id "batch-002" :weight-kg 1000.0
-                               :destination "buyer-yard-east"}})
+    (step! "shipment beyond the batch's own logged weight" "t9"
+           {:op :coordinate-shipment :effect :propose :subject "ship-3"
+            :value {:batch-id "batch-002" :weight-kg 1000.0
+                    :destination "buyer-yard-east"}})
 
-    (exec! actor "t10" {:op :schedule-maintenance :effect :propose :subject "mnt-3"
-                        :value {:equipment-id "disperser-001"
-                                :maintenance-type :force-run
-                                :scheduled-date "2026-09-01"
-                                :actuate-line? true}})
+    (step! "direct line actuation attempt (PERMANENT block)" "t10"
+           {:op :schedule-maintenance :effect :propose :subject "mnt-3"
+            :value {:equipment-id "disperser-001" :maintenance-type :force-run
+                    :scheduled-date "2026-09-01" :actuate-line? true}})
 
-    (exec! actor "t11" {:op :schedule-maintenance :effect :propose :subject "mnt-1"
-                        :value {:equipment-id "disperser-001"
-                                :maintenance-type :blade-inspection
-                                :scheduled-date "2026-08-01"
-                                :actuate-line? false}})
+    (step! "same maintenance window scheduled twice" "t11"
+           {:op :schedule-maintenance :effect :propose :subject "mnt-1"
+            :value {:equipment-id "disperser-001" :maintenance-type :blade-inspection
+                    :scheduled-date "2026-08-01" :actuate-line? false}})
 
-    (exec! actor "t12" {:op :log-production-batch :effect :propose :subject "batch-001"
-                        :patch {:product-type :unobtainium-coating}})
+    (step! "fabricated product-type" "t12"
+           {:op :log-production-batch :effect :propose :subject "batch-001"
+            :patch {:product-type :unobtainium-coating}})
 
-    (exec! actor "t13" {:op :log-production-batch :effect :propose :subject "batch-001"
-                        :patch {:viscosity-cp -5.0}})
+    (step! "implausible viscosity reading" "t13"
+           {:op :log-production-batch :effect :propose :subject "batch-001"
+            :patch {:viscosity-cp -5.0}})
 
-    (exec! actor "t14" {:op :log-production-batch :effect :propose :subject "batch-001"
-                        :patch {:fineness-of-grind-hegman 12.0}})
+    (step! "implausible fineness-of-grind reading" "t14"
+           {:op :log-production-batch :effect :propose :subject "batch-001"
+            :patch {:fineness-of-grind-hegman 12.0}})
 
-    (exec! actor "t15" {:op :log-production-batch :effect :propose :subject "batch-001"
-                        :patch {:voc-content-g-per-l 400.0}})
+    (step! "VOC content above the product type's regulatory ceiling" "t15"
+           {:op :log-production-batch :effect :propose :subject "batch-001"
+            :patch {:voc-content-g-per-l 400.0}})
 
-    db))
+    {:db db :runs @runs}))
 
-;; ----------------------------- html helpers -----------------------------
+;; ----------------------------- render helpers -----------------------------
 
-(defn- esc [v]
+(defn- esc
+  "Minimal HTML-escape -- every interpolated value passes through this."
+  [v]
   (-> (str v)
       (str/replace "&" "&amp;")
       (str/replace "<" "&lt;")
-      (str/replace ">" "&gt;")))
-
-(defn- kw->code [v]
-  (str "<code>" (esc (if (keyword? v) (str v) v)) "</code>"))
+      (str/replace ">" "&gt;")
+      (str/replace "\"" "&quot;")))
 
 (defn- yes-no [b]
-  (if (true? b)
-    "<span class=\"ok\">yes</span>"
-    "<span class=\"err\">no</span>"))
+  (if b "yes" "<span class=\"critical\">no</span>"))
 
-(defn- num-cell [v]
-  (if (nil? v) "<span class=\"muted\">&mdash;</span>"
-      (str "<span class=\"num\">" (esc v) "</span>")))
+(defn- em-dash-or [v]
+  (if (some? v) (esc v) "&mdash;"))
 
-(defn- txt [v]
-  (if (or (nil? v) (= "" v)) "<span class=\"muted\">&mdash;</span>" (esc v)))
+(defn- kw-list
+  "A live set rendered as a sorted, escaped, comma-separated code list."
+  [s]
+  (str/join ", " (for [k (sort s)] (str "<code>" (esc k) "</code>"))))
 
-(defn- row [cells]
-  (str "        <tr>" (apply str (map #(str "<td>" % "</td>") cells)) "</tr>"))
+(defn- last-fact-for [ledger subject-id]
+  (last (filter #(= subject-id (:subject %)) ledger)))
 
-(defn- table [headers rows]
-  (str "    <table>\n"
-       "      <thead><tr>" (apply str (map #(str "<th>" % "</th>") headers)) "</tr></thead>\n"
-       "      <tbody>\n"
-       (if (seq rows) (str (str/join "\n" rows) "\n") "")
-       "      </tbody>\n"
-       "    </table>\n"))
+(defn- status-cell [fact]
+  (cond
+    (nil? fact)                       ["muted" "no activity"]
+    (= :committed (:t fact))          ["ok" "committed"]
+    (= :governor-hold (:t fact))
+    ["err" (str "governor-hold: "
+                (str/join "," (map name (or (:basis fact) []))))]
+    (= :approval-rejected (:t fact))  ["err" "approval-rejected"]
+    :else                             ["muted" "in progress"]))
 
-(defn- section [title subtitle body]
-  (str "  <section class=\"card\">\n"
-       "    <h2>" title "</h2>\n"
-       "    <p class=\"muted\">" subtitle "</p>\n"
-       body
-       "  </section>\n"))
+(defn- table
+  "header-cells -> row-strings. Keeps every table's shape identical."
+  [headers rows empty-label]
+  (str "<table>\n<thead><tr>"
+       (str/join (for [h headers] (str "<th>" h "</th>")))
+       "</tr></thead>\n<tbody>\n"
+       (if (seq rows)
+         (str/join "\n" rows)
+         (str "<tr><td colspan=\"" (count headers) "\" class=\"muted\">"
+              empty-label "</td></tr>"))
+       "\n</tbody></table>"))
 
-;; ----------------------------- ledger-derived cells -----------------------------
+;; ----------------------------- tables -----------------------------
 
-(defn- last-fact-for [ledger subject]
-  (last (filter #(= (:subject %) subject) ledger)))
+(defn- batches-table
+  "Read back OUT of the store after the run -- `:shipped-weight-kg` and
+  `:last-assessed` reflect what the run actually committed."
+  [db]
+  (let [ledger (store/ledger db)]
+    (table ["id" "product-type" "material" "weight (kg)" "viscosity (cP)"
+            "VOC (g/L)" "VOC ceiling (g/L)" "Hegman" "verified?" "registered?"
+            "shipped (kg)" "last assessed" "last ledger disposition"]
+           (for [b (store/all-batches db)
+                 :let [[cls label] (status-cell (last-fact-for ledger (:id b)))]]
+             (str "<tr>"
+                  "<td><code>" (esc (:id b)) "</code></td>"
+                  "<td><code>" (esc (:product-type b)) "</code></td>"
+                  "<td>" (em-dash-or (:material b)) "</td>"
+                  "<td class=\"num\">" (em-dash-or (:weight-kg b)) "</td>"
+                  "<td class=\"num\">" (em-dash-or (:viscosity-cp b)) "</td>"
+                  "<td class=\"num\">" (em-dash-or (:voc-content-g-per-l b)) "</td>"
+                  "<td class=\"num\">"
+                  (em-dash-or (registry/voc-limit-for (:product-type b))) "</td>"
+                  "<td class=\"num\">" (em-dash-or (:fineness-of-grind-hegman b)) "</td>"
+                  "<td>" (yes-no (:verified? b)) "</td>"
+                  "<td>" (yes-no (:registered? b)) "</td>"
+                  "<td class=\"num\">" (em-dash-or (:shipped-weight-kg b)) "</td>"
+                  "<td>" (em-dash-or (:last-assessed b)) "</td>"
+                  "<td class=\"" cls "\">" (esc label) "</td>"
+                  "</tr>"))
+           "no batches")))
 
-(defn- status-cell
-  "Last ledger fact for `subject`. Only the three fact types
-  `paintmfg.operation` actually appends to the store ledger are
-  branched on -- `:approval-requested`/`:approval-granted` never reach
-  the ledger, so there is no branch for them here."
-  [ledger subject]
-  (let [f (last-fact-for ledger subject)]
-    (cond
-      (nil? f) "<span class=\"muted\">no activity</span>"
-      (= :committed (:t f)) "<span class=\"ok\">committed</span>"
-      (= :governor-hold (:t f))
-      (str "<span class=\"critical\">HARD hold &middot; "
-           (esc (str/join ", " (map name (:basis f)))) "</span>")
-      (= :approval-rejected (:t f)) "<span class=\"warn\">approver rejected</span>"
-      :else (str "<span class=\"muted\">" (esc (name (:t f))) "</span>"))))
+(defn- equipment-table [db]
+  (table ["id" "kind" "verified?" "registered?" "last maintenance"
+          "last scheduled maintenance"]
+         (for [e (store/all-equipment db)]
+           (str "<tr>"
+                "<td><code>" (esc (:id e)) "</code></td>"
+                "<td><code>" (esc (:kind e)) "</code></td>"
+                "<td>" (yes-no (:verified? e)) "</td>"
+                "<td>" (yes-no (:registered? e)) "</td>"
+                "<td>" (em-dash-or (:last-maintenance-date e)) "</td>"
+                "<td>" (em-dash-or (:last-scheduled-maintenance-date e)) "</td>"
+                "</tr>"))
+         "no equipment"))
 
-(defn- committed-subjects [ledger op-kw]
-  (->> ledger
-       (filter #(and (= :committed (:t %)) (= op-kw (:op %))))
-       (map :subject)
-       distinct))
+(defn- scenario-table
+  "One row per graph run -- the real final `:disposition` and the real
+  governor `:violations` rule keywords."
+  [runs]
+  (table ["#" "scenario" "op" "subject" "confidence" "disposition"
+          "hard?" "governor rules fired"]
+         (for [[i {:keys [label tid request state]}] (map-indexed vector runs)
+               :let [verdict (:verdict state)
+                     disposition (:disposition state)
+                     rules (mapv :rule (:violations verdict))]]
+           (str "<tr>"
+                "<td class=\"num\">" (inc i) "</td>"
+                "<td>" (esc label) " <span class=\"muted\">(" (esc tid) ")</span></td>"
+                "<td><code>" (esc (:op request)) "</code></td>"
+                "<td><code>" (esc (:subject request)) "</code></td>"
+                "<td class=\"num\">" (em-dash-or (:confidence verdict)) "</td>"
+                "<td class=\""
+                (case disposition :commit "ok" :hold "err" "warn")
+                "\">" (esc disposition) "</td>"
+                "<td>" (if (:hard? verdict)
+                         "<span class=\"critical\">HARD</span>" "&mdash;") "</td>"
+                "<td>" (if (seq rules)
+                         (str/join ", " (for [r rules]
+                                          (str "<code>" (esc r) "</code>")))
+                         "&mdash;") "</td>"
+                "</tr>"))
+         "no runs"))
 
-(defn- hold-facts [ledger]
-  (filter #(= :governor-hold (:t %)) ledger))
+(defn- safety-concerns-table [db]
+  (table ["id" "equipment" "severity" "description" "approved by"]
+         (for [c (store/safety-concerns db)]
+           (str "<tr>"
+                "<td><code>" (esc (:id c)) "</code></td>"
+                "<td><code>" (esc (:equipment-id c)) "</code></td>"
+                "<td>" (esc (:severity c)) "</td>"
+                "<td>" (esc (:description c)) "</td>"
+                "<td>" (em-dash-or (:approved-by c)) "</td>"
+                "</tr>"))
+         "none"))
 
-(defn- cited-by
-  "Ledger subjects whose fact cites `id` in its own `:basis` -- for a
-  `:committed` fact `:basis` is the advisor's `:cites` vector (the
-  equipment/batch it actually read), so this is the real reverse link
-  from an equipment unit to the maintenance windows and safety
-  concerns committed against it. Hold facts carry rule keywords in
-  `:basis`, never ids, so they can never match here."
-  [ledger id]
-  (->> ledger
-       (filter #(some #{id} (:basis %)))
-       (map :subject)
-       distinct))
+(defn- draft-records-table [db]
+  (table ["record_id" "kind" "maintenance_id / shipment_id" "equipment_id"
+          "immutable"]
+         (for [r (concat (store/maintenance-history db)
+                         (store/shipment-history db))]
+           (str "<tr>"
+                "<td><code>" (esc (get r "record_id")) "</code></td>"
+                "<td>" (esc (get r "kind")) "</td>"
+                "<td><code>" (esc (or (get r "maintenance_id")
+                                      (get r "shipment_id"))) "</code></td>"
+                "<td>" (if-let [e (get r "equipment_id")]
+                         (str "<code>" (esc e) "</code>") "&mdash;") "</td>"
+                "<td>" (esc (get r "immutable")) "</td>"
+                "</tr>"))
+         "none"))
 
-;; ----------------------------- sections -----------------------------
+(defn- observed-stakes
+  "op -> sorted set of the `:stake` values this run's REAL proposals
+  actually declared. Read out of each run's own final state, so the
+  high-stakes column below is live evidence, not prose."
+  [runs]
+  (reduce (fn [m {:keys [request state]}]
+            (if-let [stake (get-in state [:proposal :stake])]
+              (update m (:op request) (fnil conj (sorted-set)) stake)
+              m))
+          {}
+          runs))
 
-(defn- batches-section [db ledger]
-  (section
-   "Production batches"
-   (str "Live from <code>paintmfg.store/all-batches</code>. VOC ceilings are "
-        "re-derived per product type from <code>paintmfg.registry/voc-limit-for</code> "
-        "(EPA AIM / EU Decopaint 2004/42/EC modeled), never taken from the proposal.")
-   (table ["Batch" "Material" "Product type" "Produced (kg)" "Shipped (kg)"
-           "Viscosity (cP)" "VOC (g/L) / ceiling" "Hegman" "Verified &amp; registered" "Last op on this id"]
-          (for [b (store/all-batches db)]
-            (let [limit (registry/voc-limit-for (:product-type b))
-                  voc (:voc-content-g-per-l b)
-                  over? (registry/voc-content-exceeds-limit? (:product-type b) voc)]
-              (row [(str "<code>" (esc (:id b)) "</code>")
-                    (txt (:material b))
-                    (kw->code (:product-type b))
-                    (num-cell (:weight-kg b))
-                    (num-cell (:shipped-weight-kg b))
-                    (num-cell (:viscosity-cp b))
-                    (str (num-cell voc) " / " (num-cell limit)
-                         (when over? " <span class=\"err\">over</span>"))
-                    (num-cell (:fineness-of-grind-hegman b))
-                    (yes-no (registry/batch-ready? b))
-                    (status-cell ledger (:id b))]))))))
+(defn- action-gate-table
+  "Derived entirely from live values: `paintmfg.governor/allowed-ops`
+  (the closed op allowlist), `paintmfg.phase/phases` at
+  `default-phase` (`:writes` / `:auto`), and the `:stake` each op's own
+  proposal declared during this run checked against
+  `paintmfg.governor/high-stakes`. Nothing here is a hand-written row."
+  [runs]
+  (let [ph (get phase/phases phase/default-phase)
+        stakes (observed-stakes runs)]
+    (table ["op" (str "phase-" phase/default-phase " write allowed?")
+            "auto-eligible?" "stake observed this run"
+            "always escalates (high-stakes)?"]
+           (for [o (sort governor/allowed-ops)
+                 :let [seen (get stakes o)]]
+             (str "<tr>"
+                  "<td><code>" (esc o) "</code></td>"
+                  "<td>" (if (contains? (:writes ph) o)
+                           "yes" "<span class=\"warn\">no</span>") "</td>"
+                  "<td>" (if (contains? (:auto ph) o)
+                           "<span class=\"ok\">yes</span>" "no") "</td>"
+                  "<td>" (if (seq seen) (kw-list seen) "&mdash;") "</td>"
+                  "<td>" (if (seq (filter governor/high-stakes seen))
+                           "<span class=\"critical\">yes</span>" "no") "</td>"
+                  "</tr>"))
+           "no ops")))
 
-(defn- equipment-section [db ledger]
-  (section
-   "Plant equipment"
-   (str "Live from <code>paintmfg.store/all-equipment</code>. "
-        "<code>paintmfg.governor</code> independently re-derives "
-        "<code>:verified?</code> AND <code>:registered?</code> from these very "
-        "records before any maintenance window may be scheduled &mdash; the advisor's "
-        "own rationale is never trusted for it.")
-   (table ["Equipment" "Kind" "Verified &amp; registered" "Last maintenance"
-           "Last scheduled window" "Committed facts citing it"]
-          (for [e (store/all-equipment db)]
-            (let [cites (cited-by ledger (:id e))]
-              (row [(str "<code>" (esc (:id e)) "</code>")
-                    (kw->code (:kind e))
-                    (yes-no (registry/equipment-ready? e))
-                    (txt (:last-maintenance-date e))
-                    (txt (:last-scheduled-maintenance-date e))
-                    (if (seq cites)
-                      (str/join ", " (map #(str "<code>" (esc %) "</code>") cites))
-                      "<span class=\"muted\">&mdash;</span>")]))))))
+(defn- voc-ceiling-table
+  "`paintmfg.registry/voc-limit-g-per-l` itself -- the closed regulatory
+  ceiling table `voc-content-exceeds-limit?` recomputes against."
+  []
+  (table ["product-type" "VOC ceiling (g/L)"]
+         (for [pt (sort (keys registry/voc-limit-g-per-l))]
+           (str "<tr>"
+                "<td><code>" (esc pt) "</code></td>"
+                "<td class=\"num\">" (esc (registry/voc-limit-for pt)) "</td>"
+                "</tr>"))
+         "no ceilings"))
 
-(defn- maintenance-section [db ledger]
-  (section
-   "Maintenance windows drafted"
-   (str "DRAFTS only &mdash; <code>paintmfg.registry/register-maintenance</code> builds the "
-        "record a plant coordinator would keep. This actor never actuates the "
-        "mixing/dispersion or tinting/filling line. Windows held by the governor "
-        "never appear here because no record was ever written.")
-   (table ["Maintenance" "Equipment" "Type" "Scheduled for" "Draft record" "Scheduled?" "Last op on this id"]
-          (for [m (store/all-maintenance db)]
-            (row [(str "<code>" (esc (:id m)) "</code>")
-                  (str "<code>" (esc (:equipment-id m)) "</code>")
-                  (kw->code (:maintenance-type m))
-                  (txt (:scheduled-date m))
-                  (str "<code>" (esc (:maintenance-number m)) "</code>")
-                  (yes-no (:scheduled? m))
-                  (status-cell ledger (:id m))])))))
+(defn- hold-rules-table
+  "The distinct HARD rules this run actually fired, counted from the
+  ledger's own `:basis` keywords -- sorted for determinism."
+  [db]
+  (let [counts (frequencies (mapcat :basis (filter #(= :governor-hold (:t %))
+                                                   (store/ledger db))))]
+    (table ["rule" "times fired this run"]
+           (for [[rule n] (sort-by (comp str key) counts)]
+             (str "<tr>"
+                  "<td><code>" (esc rule) "</code></td>"
+                  "<td class=\"num\">" n "</td>"
+                  "</tr>"))
+           "no holds")))
 
-(defn- shipments-section [db ledger]
-  (section
-   "Shipments coordinated"
-   (str "DRAFTS only &mdash; <code>paintmfg.registry/register-shipment</code>; no freight "
-        "carrier is ever dispatched. Subjects are read back from the ledger's own "
-        "<code>:committed</code> <code>:coordinate-shipment</code> facts.")
-   (table ["Shipment" "Batch" "Weight (kg)" "Destination" "Draft record" "Last op on this id"]
-          (for [sid (committed-subjects ledger :coordinate-shipment)
-                :let [s (store/shipment db sid)]]
-            (row [(str "<code>" (esc sid) "</code>")
-                  (str "<code>" (esc (:batch-id s)) "</code>")
-                  (num-cell (:weight-kg s))
-                  (txt (:destination s))
-                  (str "<code>" (esc (:shipment-number s)) "</code>")
-                  (status-cell ledger sid)])))))
-
-(defn- safety-section [db ledger]
-  (section
-   "Safety concerns raised"
-   (str "<code>:flag-safety-concern</code> carries "
-        "<code>:coordination/safety-concern</code>, which is in the governor's own "
-        "<code>high-stakes</code> set &mdash; it ALWAYS escalates to a human plant "
-        "supervisor regardless of confidence, and is never gated on the referenced "
-        "equipment being verified.")
-   (table ["Concern" "Equipment" "Severity" "Description" "Last op on this id"]
-          (for [c (store/safety-concerns db)]
-            (row [(str "<code>" (esc (:id c)) "</code>")
-                  (str "<code>" (esc (:equipment-id c)) "</code>")
-                  (kw->code (:severity c))
-                  (txt (:description c))
-                  (status-cell ledger (:id c))])))))
-
-(defn- gate-section []
-  (let [ph (:phase coordinator)
-        {:keys [label writes auto]} (get phase/phases ph)]
-    (section
-     (str "Action gate &mdash; phase " ph " (<code>" (esc label) "</code>)")
-     (str "Derived at build time from <code>paintmfg.governor/allowed-ops</code> and "
-          "<code>paintmfg.phase/phases</code>, not hand-transcribed. A governor HARD "
-          "hold always wins over the phase gate &mdash; no phase and no human approval "
-          "can override one.")
-     (table ["Op" "Writes at this phase?" "Gate"]
-            (for [o (sort-by name governor/allowed-ops)]
-              (row [(kw->code o)
-                    (yes-no (contains? writes o))
-                    (cond
-                      (not (contains? writes o))
-                      "<span class=\"err\">HARD hold &middot; phase-disabled</span>"
-                      (contains? auto o)
-                      "<span class=\"ok\">auto-commit when governor-clean</span>"
-                      :else
-                      "<span class=\"warn\">ALWAYS human approval</span>")]))))))
-
-(defn- holds-section [ledger]
-  (let [holds (hold-facts ledger)]
-    (section
-     (str "HARD governor holds this run (" (count holds) ")")
-     (str "Every row below is the governor's OWN <code>:rule</code> and "
-          "<code>:detail</code>, exactly as <code>paintmfg.governor/hold-fact</code> "
-          "appended it to the append-only ledger. A HARD hold writes nothing to the "
-          "SSoT and never reaches a human approver.")
-     (table ["Op" "Subject" "Rule" "Governor detail" "Advisor confidence"]
-            (for [f holds
-                  v (:violations f)]
-              (row [(kw->code (:op f))
-                    (str "<code>" (esc (:subject f)) "</code>")
-                    (str "<span class=\"critical\">" (esc (name (:rule v))) "</span>")
-                    (esc (:detail v))
-                    (num-cell (:confidence f))]))))))
-
-(defn- ledger-section [ledger]
-  (section
-   (str "Append-only audit ledger (" (count ledger) " facts)")
-   (str "The complete <code>paintmfg.store/ledger</code> for this run. Only "
-        "<code>:committed</code> and the hold facts are ever persisted here; "
-        "<code>:approval-requested</code>/<code>:approval-granted</code> live on the "
-        "run's in-memory <code>:audit</code> channel only.")
-   (table ["#" "Fact" "Op" "Subject" "Disposition" "Basis"]
-          (map-indexed
-           (fn [i {:keys [t op subject disposition basis summary]}]
-             (row [(num-cell (inc i))
-                   (str (if (= :committed t)
-                          "<span class=\"ok\">"
-                          "<span class=\"critical\">")
-                        (esc (name t)) "</span>")
-                   (kw->code op)
-                   (str "<code>" (esc subject) "</code>")
-                   (kw->code disposition)
-                   (str (esc (str/join ", " (map name (or basis []))))
-                        (when summary
-                          (str "<br><span class=\"muted\">" (esc summary) "</span>")))]))
-           ledger))))
+(defn- audit-ledger-table [db]
+  (table ["#" "t" "op" "actor" "subject" "disposition" "basis / rule" "summary"]
+         (for [[i f] (map-indexed vector (store/ledger db))]
+           (str "<tr>"
+                "<td class=\"num\">" (inc i) "</td>"
+                "<td>" (esc (:t f)) "</td>"
+                "<td><code>" (esc (:op f)) "</code></td>"
+                "<td><code>" (esc (:actor f)) "</code></td>"
+                "<td><code>" (esc (:subject f)) "</code></td>"
+                "<td class=\""
+                (case (:disposition f) :commit "ok" :hold "err" "muted")
+                "\">" (esc (:disposition f)) "</td>"
+                "<td>" (if (seq (:basis f))
+                         (str/join ", " (for [b (:basis f)]
+                                          (str "<code>" (esc b) "</code>")))
+                         "&mdash;") "</td>"
+                "<td>" (if-let [s (:summary f)]
+                         (esc s)
+                         (esc (str/join " / " (map :detail (:violations f)))))
+                "</td>"
+                "</tr>"))
+         "empty ledger"))
 
 ;; ----------------------------- document -----------------------------
 
 (defn render
-  "Renders the whole operator console from a store `db` that has
-  already been driven by `run-demo!` (or any other real scenario)."
-  [db]
-  (let [ledger (vec (store/ledger db))]
+  "Renders the full operator-console document from `run-demo!`'s result."
+  [{:keys [db runs]}]
+  (let [ph (get phase/phases phase/default-phase)]
     (str
-     "<!DOCTYPE html>\n"
-     "<html lang=\"en\">\n"
-     "<head>\n"
-     "<meta charset=\"utf-8\">\n"
+     "<!doctype html>\n"
+     "<html lang=\"ja\">\n<head>\n<meta charset=\"utf-8\">\n"
      "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n"
      "<meta name=\"color-scheme\" content=\"light\">\n"
-     "<title>cloud-itonami-isic-2022 &middot; paintmfg operator console</title>\n"
-     "<style>\n" (skin/dds+skin) "\n</style>\n"
-     "</head>\n"
-     "<body>\n"
+     "<title>cloud-itonami-isic-2022 &middot; paints / varnishes / printing ink / mastics plant ops</title>\n"
+     "<style>"
+     (jp-go-dds.skin/dds+skin)
+     "</style>\n"
+     "</head>\n<body>\n"
      "<header class=\"bar\">\n"
-     "  <h1>Paints, varnishes, printing ink &amp; mastics plant operations (ISIC 2022) &mdash; Operator Console</h1>\n"
+     "  <h1>Paint &amp; Coatings Plant Operations Governor — Operator Console (ISIC 2022)</h1>\n"
+     "  <p class=\"subtitle\">read-only sample · governor-gated · phase "
+     phase/default-phase " (" (esc (:label ph)) ")"
+     " · confidence floor " (esc governor/confidence-floor)
+     " · direct dispersion/tinting/filling-line actuation permanently blocked</p>\n"
      "</header>\n"
-     "<p class=\"subtitle\"><span class=\"badge\">read-only sample</span> "
-     "Build-time generated by <code>clojure -M:dev:render-html</code> "
-     "(<code>paintmfg.render-html</code>) by driving the real "
-     "<code>paintmfg.operation</code> actor over a freshly seeded "
-     "<code>paintmfg.store</code>. Every value below is store or governor output.</p>\n"
      "<main>\n"
-     (batches-section db ledger)
-     (equipment-section db ledger)
-     (maintenance-section db ledger)
-     (shipments-section db ledger)
-     (safety-section db ledger)
-     (gate-section)
-     (holds-section ledger)
-     (ledger-section ledger)
+
+     "  <section class=\"card\">\n"
+     "    <h2>Scenario (this run)</h2>\n"
+     "    <p class=\"muted\">Build-time output of <code>paintmfg.render-html</code> (<code>clojure -M:dev:render-html</code>): each row is one real <code>langgraph.graph/run*</code> through <code>paintmfg.operation</code>. Approvals are real resumes of the <code>:request-approval</code> interrupt. Every batch/equipment id referenced below is a <code>paintmfg.store/sample-data!</code> seed id.</p>\n"
+     (scenario-table runs) "\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Production batches (store state AFTER the run)</h2>\n"
+     "    <p class=\"muted\">Read back out of <code>paintmfg.store</code>, not copied from the requests — <code>shipped (kg)</code> and <code>last assessed</code> moved because commits really happened. The VOC ceiling column is <code>paintmfg.registry/voc-limit-for</code> applied to each batch's own recorded product type.</p>\n"
+     (batches-table db) "\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Equipment (dispersion / milling / tinting / filling)</h2>\n"
+     "    <p class=\"muted\">An UNVERIFIED or unregistered unit can never have maintenance scheduled against it — <code>equipment-not-verified</code> is recomputed by the governor from these very fields, never taken from the advisor's rationale.</p>\n"
+     (equipment-table db) "\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Safety concerns (flagged this run)</h2>\n"
+     "    <p class=\"muted\">Always human-approved — <code>:coordination/safety-concern</code> is in <code>paintmfg.governor/high-stakes</code>, and <code>:flag-safety-concern</code> is in no phase's <code>:auto</code> set. Two independent layers agree.</p>\n"
+     (safety-concerns-table db) "\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Committed draft records</h2>\n"
+     "    <p class=\"muted\">Unsigned drafts only (<code>paintmfg.registry</code>) — this actor never actuates a mixing/dispersion line and never dispatches a real freight carrier.</p>\n"
+     (draft-records-table db) "\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Action gate</h2>\n"
+     "    <p class=\"muted\">Derived from live values: <code>paintmfg.governor/allowed-ops</code>, <code>paintmfg.phase/phases</code> at phase "
+     phase/default-phase ", and the <code>:stake</code> each op's own proposal declared during this run.</p>\n"
+     (action-gate-table runs) "\n"
+     "    <p class=\"muted\">Closed proposal-effect allowlist: " (kw-list governor/allowed-proposal-effects)
+     ". High-stakes set: " (kw-list governor/high-stakes)
+     ". Phase-" phase/default-phase " writes: " (kw-list (:writes ph))
+     ". Phase-" phase/default-phase " auto: " (kw-list (:auto ph))
+     ". All write ops: " (kw-list phase/write-ops) ".</p>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>HARD holds fired (this run)</h2>\n"
+     "    <p class=\"muted\">Counted from the ledger's own <code>:basis</code> rule keywords. A HARD hold cannot be overridden by any phase or any human approval — <code>line-actuate-blocked</code> and <code>line-control-blocked</code> are the two permanent scope boundaries.</p>\n"
+     (hold-rules-table db) "\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>VOC-content regulatory ceilings</h2>\n"
+     "    <p class=\"muted\"><code>paintmfg.registry/voc-limit-g-per-l</code> — the closed table <code>voc-content-exceeds-limit?</code> independently recomputes against (modeled on the U.S. EPA AIM VOC-content-limit framework / EU Decopaint Directive 2004/42/EC; representative, not an exhaustive multi-jurisdiction database).</p>\n"
+     (voc-ceiling-table) "\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Audit ledger (this run)</h2>\n"
+     "    <p class=\"muted\">Append-only decision-fact log — every commit and every hold this scenario produced, in order.</p>\n"
+     (audit-ledger-table db) "\n"
+     "  </section>\n"
+
      "</main>\n"
-     "<footer class=\"footer\">\n"
-     "  <p>Actor: PaintOperationActor (langgraph-clj StateGraph) &mdash; PaintAdvisor "
-     "sealed in <code>:advise</code>, censored by the Paint &amp; Coatings Plant "
-     "Operations Governor in <code>:govern</code>, phase-gated in <code>:decide</code>. "
-     "This actor NEVER actuates mixing/dispersion or tinting/filling-line equipment and "
-     "NEVER dispatches freight; it drafts records a human plant supervisor signs.</p>\n"
-     "  <p class=\"muted\">Deterministic: no timestamps, no randomness. Re-running "
-     "<code>clojure -M:dev:render-html</code> against the same seed reproduces this file "
-     "byte for byte.</p>\n"
+     "<footer>\n"
+     "  <p>Generated at build time by <code>paintmfg.render-html</code> from a real actor run. Deterministic: no timestamps, no randomness — two consecutive runs are byte-identical.</p>\n"
      "</footer>\n"
-     "</body>\n</html>\n")))
+     "</body></html>\n")))
 
 (defn -main [& args]
   (let [out (or (first args) "docs/samples/operator-console.html")
-        db (run-demo!)
-        html (render db)
-        f (io/file out)]
-    (when-let [parent (.getParentFile f)] (.mkdirs parent))
-    (with-open [w (io/writer f :encoding "UTF-8")]
-      (.write w ^String html))
+        {:keys [db runs] :as result} (run-demo!)
+        html (render result)
+        f (java.io.File. out)]
+    (when-let [parent (.getParentFile f)]
+      (.mkdirs parent))
+    (spit out html)
     (println "wrote" out
-             "(" (count (store/ledger db)) "ledger facts,"
-             (count (hold-facts (store/ledger db))) "HARD holds,"
-             (count (store/maintenance-history db)) "maintenance drafts,"
-             (count (store/shipment-history db)) "shipment drafts,"
-             (count (store/safety-concerns db)) "safety concerns )")))
+             (str "(" (count runs) " runs, "
+                  (count (store/ledger db)) " ledger facts, "
+                  (count (store/maintenance-history db)) " maintenance drafts, "
+                  (count (store/shipment-history db)) " shipment drafts, "
+                  (count (store/safety-concerns db)) " safety concerns)"))))
