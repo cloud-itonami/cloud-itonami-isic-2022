@@ -5,7 +5,7 @@
  ;; standalone (forkable outside the workspace); the :local/root paths
  ;; only resolve inside the monorepo checkout -- a standalone fork
  ;; should override them with git coordinates. langchain is pinned here
- ;; directly (not only under :dev) so a bare `clojure -M:test` works
+ ;; directly (not only under :dev) so a bare `kbb -M:test` works
  ;; offline inside the monorepo checkout without depending on
  ;; langgraph's own transitive git/sha pin being fetchable.
  :deps {
@@ -19,7 +19,7 @@
         {:local/root "../../kotoba-lang/langchain"}
         ;; jp-go-digital-design-system (デジタル庁デザインシステム, DADS) -- the
         ;; workspace-wide BASE design system. Consumed as a PINNED GIT dep
-        ;; (not :local/root) so `clojure -M:dev:render-html` also resolves in
+        ;; (not :local/root) so `kbb -M:dev:render-html` also resolves in
         ;; a standalone fork; `jp-go-dds.skin/dds+skin` is the vendored DADS
         ;; CSS plus the compat skin that styles plain semantic markup without
         ;; rewriting it. Used ONLY by `paintmfg.render-html`, a build-time
@@ -34,9 +34,9 @@
   :dev {:override-deps
         {io.github.kotoba-lang/langchain
          {:local/root "../../kotoba-lang/langchain"}}}
-  ;; clojure -M:dev:run  -> drive the demo through one OperationActor
+  ;; kbb -M:dev:run  -> drive the demo through one OperationActor
   :run {:main-opts ["-m" "paintmfg.sim"]}
-  ;; clojure -M:dev:render-html [out-file] -> regenerate
+  ;; kbb -M:dev:render-html [out-file] -> regenerate
   ;; docs/samples/operator-console.html by driving the REAL actor stack
   ;; (paintmfg.store -> paintmfg.operation -> paintmfg.governor).
   :render-html {:main-opts ["-m" "paintmfg.render-html"]}
