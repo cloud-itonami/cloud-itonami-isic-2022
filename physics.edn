@@ -1,0 +1,44 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; The README has no "Robotics premise" section; its Scope names the plant
+;; this actor coordinates (ISIC 2022): mixing/dispersion equipment (high-speed
+;; disperser, bead/ball mill) and the tinting/filling line for paints,
+;; varnishes, printing inks and mastics. The physical work of that plant
+;; taken here: holding the mill base below its temperature limit while the
+;; bead mill dissipates grinding power, transferring let-down varnish to the
+;; filler, and stacking filled 20 L pails on pallets.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-2022"
+ :cases
+ [{:id :bead-mill-heat-up
+   :kind :thermal
+   :procedure "bead mill grinds a solvent-borne mill base: grinding power dissipated in a 30 mm layer against the 15 C cooling-water jacket (mid-layer adiabatic), 30 minutes"
+   :params {:thickness-m 0.03 :conductivity-w-mk 0.25 :density-kg-m3 1400.0 :specific-heat-j-kgk 2000.0
+            :t0-c 20.0 :t-hot-c 15.0 :h-front-w-m2k 500.0 :h-back-w-m2k 0.0
+            :threshold-c 50.0 :duration-s 1800.0 :nodes 11}
+   :sweep {:param :q-gen-w-m3 :values [20000.0 50000.0 80000.0 120000.0 160000.0]}
+   :quantity :peak-back-c
+   :limit {:max 50.0 :basis "estimate: 50 C taken as the mill-base limit for a solvent-borne paint (solvent loss, resin damage)"}
+   :boundary {:lo 5000.0 :hi 400000.0}}
+  {:id :varnish-to-filler
+   :kind :pipe-flow
+   :procedure "pump let-down varnish from the let-down tank to the filling line (65 mm, 60 m, 3 m rise)"
+   :params {:diameter-m 0.065 :length-m 60.0 :roughness-m 1.5e-6 :density-kg-m3 950.0
+            :viscosity-pa-s 0.3 :pump-efficiency 0.55 :elevation-m 3.0}
+   :sweep {:param :q-m3s :values [0.001 0.002 0.004 0.006 0.008]}
+   :quantity :pressure-drop-pa
+   :limit {:max 500000.0 :basis "estimate: 5 bar discharge limit assumed for the gear transfer pump"}
+   :boundary {:lo 0.0005 :hi 0.03}}
+  {:id :pail-palletising
+   :kind :manipulator
+   :procedure "arm lifts filled, lidded 20 L paint pails off the filling conveyor onto the pallet's top layer"
+   :params {:l1-m 0.70 :l2-m 0.60 :m1-kg 12.0 :m2-kg 8.0
+            :from [0.90 0.20] :to [0.40 0.90] :duration-s 2.5 :steps 500}
+   :sweep {:param :payload-kg :values [7.0 14.0 21.0 28.0 35.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 500.0 :basis "estimate: continuous shoulder torque of a ~50 kg-payload palletising arm class"}
+   :boundary {:lo 1.0 :hi 100.0}}]}
