@@ -34,7 +34,7 @@
 
   Usage: `kbb -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
-  (:require [clojure.java.io :as io]
+  (:require [kotoba.io :as io]
             [kotoba.lang.text :as str]
             [jp-go-dds.skin :as skin]
             [langgraph.graph :as g]
@@ -466,7 +466,7 @@
         db (run-demo!)
         html (render db)
         f (io/file out)]
-    (when-let [parent (.getParentFile f)] (.mkdirs parent))
+    (when-let [parent (io/parent-file f)] (io/mkdirs parent))
     (with-open [w (io/writer f :encoding "UTF-8")]
       (.write w ^String html))
     (println "wrote" out
